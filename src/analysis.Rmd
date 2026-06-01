@@ -1,0 +1,770 @@
+---
+title: "Fibroid analysis"
+author: "Jessica Chung"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: true
+    toc_depth: 4
+    df_print: paged
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning=TRUE, message=TRUE, error=TRUE, echo=TRUE, results="hold")
+knitr::opts_knit$set(root.dir = "..")
+options(digits=4)
+options(width=120)
+```
+
+# Load
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(here)
+library(endest)
+library(limma)
+library(edgeR)
+library(splines)
+library(patchwork)
+library(org.Hs.eg.db)
+library(clusterProfiler)
+library(EnhancedVolcano)
+library(ggfortify)
+library(ggrepel)
+
+select <- dplyr::select
+rename <- dplyr::rename
+```
+
+```{r}
+counts_unique <- read_tsv(here("data/2025-09/summary_unique.tsv"))
+```
+
+-----
+
+# Wrangle counts
+
+```{r}
+counts_unique[1:10,1:10]
+```
+
+```{r}
+gene_cols <- counts_unique[,1:2]
+original_sample_names <- colnames(counts_unique)
+counts_unique <- as.matrix(counts_unique[,-c(1:2)])
+stopifnot(! duplicated(gene_cols$gene_id))
+rownames(counts_unique) <- gene_cols$gene_id
+colnames(counts_unique) <- sapply(str_split(colnames(counts_unique), " "), \(x) x[1])
+```
+
+```{r}
+table(sapply(str_split(original_sample_names, "AUB-"), \(x) x[2]))
+```
+
+```{r}
+head(counts_unique, 5:6)
+```
+
+```{r}
+colSums(counts_unique)
+```
+
+```{r}
+dim(counts_unique)
+table(str_detect(rownames(counts_unique), "^ENSG"))
+counts_unique[! str_detect(rownames(counts_unique), "^ENSG"),] %>% head(5:6)
+```
+
+```{r}
+counts_unique <- counts_unique[str_detect(rownames(counts_unique), "^ENSG"),]
+```
+
+```{r}
+endest_counts_unique <- estimate_cycle_time(counts_unique)
+```
+
+-----
+
+# Phenotype info
+
+```{r}
+table(sapply(str_split(original_sample_names, "AUB-"), \(x) x[2]))
+```
+
+```{r}
+group <- sapply(str_split(original_sample_names[-c(1,2)], "AUB-"), \(x) substr(x[2], 1, 1))
+group <- paste0("AUB-", group)
+table(group)
+```
+
+```{r}
+cycle_phase <- tolower(sapply(str_split(original_sample_names[-c(1,2)], "AUB-[EL] "), \(x) x[2]))
+cycle_phase[cycle_phase == "early mid sec"] <- "early-mid sec"
+table(cycle_phase)
+```
+
+```{r}
+cycle_phase_pretty <- case_when(
+  cycle_phase == "prolif" ~ "Proliferative",
+  cycle_phase == "early sec" ~ "Early Secretory",
+  cycle_phase == "early-mid sec" ~ "Early-mid Secretory",
+  cycle_phase == "mid sec" ~ "Mid-secretory"
+) %>% 
+  factor(levels=c("Proliferative", "Early Secretory", "Early-mid Secretory", "Mid-secretory"))
+table(cycle_phase_pretty)
+```
+
+```{r}
+sample_info <- data.frame(sample_id=colnames(counts_unique),
+                          group=group,
+                          cycle_phase=cycle_phase,
+                          cycle_phase_pretty=cycle_phase_pretty,
+                          time=endest_counts_unique$estimated_time)
+```
+
+```{r}
+tmp <- as.numeric(str_remove(sample_info$sample_id, "^S"))
+batch <- ifelse(tmp <= 34, "batch_1", "batch_2")
+sample_info$batch <- batch
+```
+
+```{r}
+sample_info %>% arrange(time)
+```
+
+```{r}
+table(paste(sample_info$group, sample_info$cycle_phase), sample_info$batch)
+```
+
+```{r}
+sample_info$cycle <- ifelse(str_detect(sample_info$cycle_phase, "sec$"), "sec", "pro")
+```
+
+```{r}
+table(paste(sample_info$group, sample_info$cycle), sample_info$batch)
+```
+
+-----
+
+# Plots
+
+```{r}
+ggplot(sample_info, aes(x=time, y=batch, color=group, label=sample_id)) +
+  geom_text(position=position_jitter(width=0,height=0.1), size=3) +
+  theme_bw()
+```
+
+```{r}
+ggplot(sample_info, aes(x=time, y=batch, color=cycle, label=sample_id)) +
+  geom_text(position=position_jitter(width=0,height=0.1)) +
+  theme_bw()
+```
+
+-----
+
+# Prepare counts
+
+```{r}
+y <- DGEList(counts_unique, samples=sample_info)
+y <- calcNormFactors(y)
+```
+
+```{r}
+ok <- rowMeans(cpm(y) > 0.5) > 0.5
+table(ok)
+```
+
+```{r}
+y <- y[ok, ,keep.lib.sizes=FALSE]
+y <- calcNormFactors(y)
+y$samples
+```
+
+```{r}
+# Get Ensembl IDs in expression data
+ensembl <- names(ok)[ok]
+length(ensembl)
+
+# Get gene info from org.Hs.eg.db
+# columns(org.Hs.eg.db)
+cols <- c("SYMBOL", "ENTREZID", "GENENAME")
+annotation <- AnnotationDbi::select(org.Hs.eg.db, keys=ensembl, columns=cols, keytype="ENSEMBL")
+```
+
+```{r}
+# Show duplicates
+annotation %>% filter(ENSEMBL %in% annotation[duplicated(annotation$ENSEMBL),"ENSEMBL"])
+
+# Take the first row if duplicate annotations
+annotation <- annotation[!duplicated(annotation$ENSEMBL),]
+dim(annotation)
+```
+
+```{r}
+stopifnot(names(ok[ok]) == annotation$ENSEMBL)
+y <- DGEList(counts_unique[ok,], genes=annotation, samples=sample_info)
+y <- calcNormFactors(y)
+nc <- cpm(y, normalized.lib.sizes=TRUE, log=TRUE)
+```
+
+-----
+
+# PCA plots
+
+```{r}
+pca <- prcomp(t(nc))
+dat <- cbind(pca$x[,1:5], sample_info)
+```
+
+```{r}
+ggplot(dat, aes(x=PC1, y=PC2, color=time, label=sample_id)) +
+  geom_text() +
+  scale_colour_gradientn(limits=c(0,100), colors=rainbow(20)[2:19], name="Cycle Time") +
+  theme_bw() +
+  coord_fixed() +
+  labs(title="PCA: Unnormalised Data")
+```
+
+```{r}
+(pca$sdev^2 / sum(pca$sdev^2)) %>% head
+```
+
+```{r}
+autoplot(pca) +
+  theme_bw()
+```
+
+### Pretty PCA plots
+
+```{r}
+pc1_lab <- sprintf("PC1 (%0.1f%%)", (pca$sdev^2 / sum(pca$sdev^2))[1] * 100)
+pc1_lab
+pc2_lab <- sprintf("PC2 (%0.1f%%)", (pca$sdev^2 / sum(pca$sdev^2))[2] * 100)
+pc2_lab
+```
+
+```{r}
+dat <- dat %>% mutate(`Menstrual Cycle Phase`=factor(case_when(
+  cycle_phase == "prolif" ~ "Proliferative",
+  cycle_phase == "early_sec" ~ "Early-secretory",
+  cycle_phase == "early-mid_sec" ~ "Early-mid-secretory",
+  TRUE ~ "Mid-secretory"
+), levels=c("Proliferative", "Early-secretory", "Early-mid-secretory", "Mid-secretory")))
+```
+
+
+```{r fig.height=5, fig.width=6}
+g_histo <- ggplot(dat %>% mutate(Group=group, `Menstrual Cycle Phase`=cycle_phase_pretty), 
+                   aes(x=PC1, y=PC2, color=`Menstrual Cycle Phase`, shape=Group)) +
+  geom_point(size=3) +
+  scale_colour_discrete(name="Menstrual Cycle\nPhase") +
+  theme_bw() +
+  coord_fixed() +
+  labs(x=pc1_lab, y=pc2_lab) +
+  guides(shape=guide_legend(order=1))
+g_histo
+```
+
+```{r}
+ggsave(g_histo, filename=here("outputs/fig_3a.png"), height=10, width=12, scale=0.5)
+```
+
+```{r}
+ggsave(g_histo, filename=here("outputs/fig_3a.pdf"), height=10, width=12, scale=0.5)
+```
+
+
+```{r}
+jet_palette <- function(n = 256) {
+  colorRampPalette(c("#00007F", "#0000FF", "#007FFF", "#00FFFF",
+                     "#00FF00", "#FFDB4D", "#FF7F00", "#FF0000",
+                     "#7F0000"))(n)
+}
+```
+
+
+```{r fig.height=5, fig.width=5.5}
+g_molecular <- ggplot(dat %>% mutate(Group=group), aes(x=PC1, y=PC2, color=time, shape=Group)) +
+  geom_point(size=3) +
+  scale_colour_gradientn(limits=c(0,100), colors=jet_palette(20)[20:1], name="Molecular\nCycle Time") +
+  theme_bw() +
+  coord_fixed() + 
+  labs(x=pc1_lab, y=pc2_lab)
+g_molecular
+```
+
+```{r}
+ggsave(filename=here("outputs/fig_3b.png"), height=10, width=12, scale=0.5)
+```
+
+```{r}
+ggsave(filename=here("outputs/fig_3b.pdf"), height=10, width=12, scale=0.5)
+```
+
+```{r}
+# Output patchwork combined plot so both plots are the same size despite different legend sizes
+fig_3ab <- g_histo + g_molecular
+```
+
+```{r}
+ggsave(fig_3ab, filename=here("outputs/fig_3ab.pdf"), height=10, width=20, scale=1.5, units="cm")
+```
+
+```{r}
+ggsave(fig_3ab, filename=here("outputs/fig_3ab.png"), height=10, width=20, scale=1.5, units="cm")
+```
+
+
+### Batch PCA plots
+
+```{r}
+ggplot(dat, aes(x=PC1, y=PC2, color=cycle, label=sample_id)) +
+  geom_text() +
+  theme_bw()
+```
+
+```{r}
+ggplot(dat, aes(x=PC1, y=PC2, color=batch, label=sample_id)) +
+  geom_text() +
+  theme_bw() +
+  coord_fixed() +
+  labs(title="PCA: Unnormalised Data")
+```
+
+```{r}
+ggplot(dat, aes(x=PC1, y=PC2, color=group, label=sample_id)) +
+  geom_text() +
+  theme_bw()
+```
+
+```{r}
+ggplot(dat, aes(x=PC3, y=PC1, color=batch, label=sample_id)) +
+  geom_text() +
+  theme_bw()
+```
+
+```{r}
+head(pca$sdev^2 / sum(pca$sdev^2), 10)
+```
+
+-----
+
+# DGE (separate cycle stages)
+
+```{r}
+# # Check a sensible df to use for splines
+# library(mgcv)
+# 
+# x <- sample_info$time
+# fit_summary_list <- lapply(1:nrow(nc), \(i) {
+#   exprs <- nc[i, pheno$sample_id]
+#   fit <- gam(exprs ~ batch + s(x, k=20, fx=FALSE), gamma=2)
+#   fit_summary <- summary(fit)
+#   return(c(fit_summary$edf, fit_summary$r.sq))
+# })
+# 
+# edf <- sapply(fit_summary_list, \(x) x[1])
+# quantile(edf, c(0.5, 0.9, 0.99, 0.999, 0.9999, 1))
+# hist(edf)
+# 
+# #   50%    90%    99%  99.9% 99.99%   100% 
+# # 1.246  3.936  5.983  7.126  7.728  8.071 
+```
+
+
+```{r}
+pheno <- sample_info %>%
+  mutate(fibroid=ifelse(group == "AUB-E", "control", "fibroid"),
+         group=paste(cycle, fibroid, sep="_"))
+```
+
+```{r}
+table(pheno$group)
+```
+
+```{r}
+design <- model.matrix(~0 + group + ns(time, 8) + batch, pheno)
+colnames(design) <- str_remove(colnames(design), "^group")
+colnames(design) <- str_remove_all(colnames(design), "ns\\(|, 8\\)")
+cm <- makeContrasts(pro=pro_fibroid-pro_control,
+                    sec=sec_fibroid-sec_control,
+                    levels=design)
+```
+
+```{r}
+v <- voom(y, design, plot=TRUE)
+fit <- lmFit(v, design)
+fit <- contrasts.fit(fit, cm)
+fit <- eBayes(fit)
+```
+
+```{r}
+top_pro <- topTable(fit, coef="pro", n=Inf, sort.by="p")
+top_sec <- topTable(fit, coef="sec", n=Inf, sort.by="p")
+```
+
+```{r}
+hist(top_pro$P.Value, breaks=100)
+```
+
+```{r}
+hist(top_sec$P.Value, breaks=100)
+```
+
+```{r}
+head(top_pro, 100)
+```
+
+```{r}
+head(top_sec, 100)
+```
+
+```{r}
+table(top_pro$adj.P.Val < 0.05)
+table(top_sec$adj.P.Val < 0.05)
+```
+
+## Plots
+
+```{r}
+des <- model.matrix(~0 + group + ns(time, 8), pheno)
+bcnc <- removeBatchEffect(nc, batch=sample_info$batch, design=des)
+```
+
+### Proliferative
+
+```{r}
+for (gid in head(rownames(top_pro), 10)) {
+  print(gid)
+  dat <- sample_info %>%
+    mutate(exprs=nc[gid,])
+  g <- ggplot(dat, aes(x=time, y=exprs, colour=group, shape=batch)) +
+    geom_point() +
+    theme_bw() +
+    labs(title=gid)
+  print(g)
+}
+```
+
+```{r}
+for (gid in head(rownames(top_pro), 10)) {
+  print(gid)
+  dat <- sample_info %>%
+    mutate(normalised_exprs=bcnc[gid,])
+  g <- ggplot(dat, aes(x=time, y=normalised_exprs, colour=group, shape=batch)) +
+    geom_point() +
+    theme_bw() +
+    labs(title=gid)
+  print(g)
+}
+```
+
+```{r}
+volcanoplot(fit, coef="pro", highlight=10, names=fit$genes$SYMBOL)
+```
+
+```{r fig.height=7, fig.width=7}
+EnhancedVolcano::EnhancedVolcano(
+  top_pro,
+  lab=top_pro$SYMBOL,
+  x="logFC",
+  y="P.Value",
+  pCutoff=3.63e-05,
+  ylim = c(0, 8),
+  # title="",
+  subtitle="AUB-L vs AUB-E (Proliferative)")
+```
+
+### Secretory
+
+```{r}
+for (gid in head(rownames(top_sec), 10)) {
+  print(gid)
+  dat <- sample_info %>%
+    mutate(exprs=nc[gid,])
+  g <- ggplot(dat, aes(x=time, y=exprs, colour=group, shape=batch)) +
+    geom_point() +
+    theme_bw() +
+    labs(title=gid)
+  print(g)
+}
+```
+
+```{r}
+for (gid in head(rownames(top_sec), 10)) {
+  print(gid)
+  dat <- sample_info %>%
+    mutate(normalised_exprs=bcnc[gid,])
+  g <- ggplot(dat, aes(x=time, y=normalised_exprs, colour=group, shape=batch)) +
+    geom_point() +
+    theme_bw() +
+    labs(title=gid)
+  print(g)
+}
+```
+
+
+```{r}
+volcanoplot(fit, coef="sec", highlight=1, names=fit$genes$SYMBOL)
+```
+
+```{r fig.height=7, fig.width=7}
+EnhancedVolcano::EnhancedVolcano(
+  top_sec,
+  lab=top_sec$SYMBOL,
+  x="logFC",
+  y="P.Value",
+  pCutoff=1.5e-05,
+  ylim = c(0, 8),
+  # title="",
+  subtitle="AUB-L vs AUB-E (Secretory)")
+```
+
+-----
+
+# DGE (combined cycle stages)
+
+```{r}
+pheno <- sample_info %>%
+  mutate(fibroid=ifelse(group == "AUB-E", "control", "fibroid"),
+         group=paste(cycle, fibroid, sep="_"))
+```
+
+```{r}
+table(pheno$fibroid)
+```
+
+
+```{r}
+design <- model.matrix(~0 + fibroid + ns(time, 8) + batch, pheno)
+colnames(design) <- str_remove(colnames(design), "^fibroid")
+colnames(design) <- str_remove_all(colnames(design), "ns\\(|, 8\\)")
+cm <- makeContrasts(case=fibroid-control,
+                    levels=design)
+```
+
+
+```{r}
+v <- voom(y, design, plot=TRUE)
+fit2 <- lmFit(v, design)
+fit2 <- contrasts.fit(fit2, cm)
+fit2 <- eBayes(fit2)
+```
+
+```{r}
+top <- topTable(fit2, coef="case", n=Inf, sort.by="p")
+```
+
+```{r}
+hist(top$P.Value, breaks=100)
+```
+
+```{r}
+head(top, 100)
+```
+
+```{r}
+table(top$adj.P.Val < 0.05)
+```
+
+```{r}
+table(top$adj.P.Val < 0.05,
+      top$logFC > 0)
+```
+
+## Volcano plot
+
+```{r fig.height=4, fig.width=7}
+g_volcano <- ggplot(top %>% mutate(sig=ifelse(adj.P.Val < 0.05, "Significant", "Not Significant")), 
+       aes(x=logFC, y=-log10(P.Value), color=sig)) +
+  geom_point(size=1, alpha=0.4) +
+  geom_text_repel(data=head(top, 10) %>% filter(! is.na(SYMBOL)), mapping=aes(label=SYMBOL), 
+                  color="black", size=3) +
+  scale_color_manual(values=c("Significant"="red", "Not Significant"="black")) +
+  scale_x_continuous(limits=c(-4,4)) +
+  theme_bw() +
+  guides(color=guide_legend(title=NULL)) +
+  theme(panel.grid=element_blank()) +
+  labs(y=expression(-log[10](P)),
+       x=expression(log[2](Fold~Change)))
+g_volcano
+```
+
+```{r}
+ggsave(g_volcano, filename=here("outputs/fig_3c.png"), height=4, width=7, scale=1)
+```
+
+```{r}
+ggsave(g_volcano, filename=here("outputs/fig_3c.pdf"), height=4, width=7, scale=1)
+```
+
+
+```{r fig.height=7, fig.width=7}
+# EnhancedVolcano::EnhancedVolcano(
+#   top,
+#   lab=top$SYMBOL,
+#   x="logFC",
+#   y="P.Value",
+#   pCutoff=2.5e-04,
+#   ylim = c(0, 8),
+#   # title="",
+#   subtitle="AUB-L vs AUB-E")
+```
+
+## Plots
+
+```{r}
+for (gid in head(rownames(top), 10)) {
+  print(gid)
+  dat <- sample_info %>%
+    mutate(exprs=nc[gid,])
+  g <- ggplot(dat, aes(x=time, y=exprs, colour=group, shape=batch)) +
+    geom_point() +
+    theme_bw() +
+    labs(title=gid)
+  print(g)
+}
+```
+
+
+```{r}
+for (gid in head(rownames(top), 10)) {
+  print(gid)
+  dat <- sample_info %>%
+    mutate(normalised_exprs=bcnc[gid,])
+  g <- ggplot(dat, aes(x=time, y=normalised_exprs, colour=group, shape=batch)) +
+    geom_point() +
+    theme_bw() +
+    labs(title=gid)
+  print(g)
+}
+```
+
+## ORA
+
+Using adjusted p-value threshold of 0.1
+
+```{r}
+run_ora <- function(top_table, run_go=TRUE, run_kegg=FALSE,
+                    run_reactome=FALSE, p_threshold=0.05,
+                    directional=TRUE) {
+  up_de <- top_table %>% filter(adj.P.Val < p_threshold, logFC > 0) %>%
+    pull(entrez_gene_id)
+  down_de <- top_table %>% filter(adj.P.Val < p_threshold, logFC < 0) %>%
+    pull(entrez_gene_id)
+  de <- top_table %>% filter(adj.P.Val < p_threshold) %>%
+    pull(entrez_gene_id)
+  universe <- top_table$entrez_gene_id
+  results <- list()
+  # qvalueCutoff=0.05 argument doesn't work... Filter manually afterwards
+  if (run_go) {
+    if (directional) {
+      results[["up_go"]] <-
+        enrichGO(up_de, OrgDb = "org.Hs.eg.db", ont="all",
+                 universe=universe, readable=TRUE)
+      results[["down_go"]] <-
+        enrichGO(down_de, OrgDb = "org.Hs.eg.db", ont="all",
+                 universe=universe, readable=TRUE)
+    } else {
+      results[["go"]] <-
+        enrichGO(de, OrgDb = "org.Hs.eg.db", ont="all",
+                 universe=universe, readable=TRUE)
+    }
+  }
+  if (run_kegg) {
+    if (directional) {
+      results[["up_kegg"]] <-
+        enrichKEGG(up_de, organism="hsa", universe=universe)
+      results[["down_kegg"]] <-
+        enrichKEGG(down_de, organism="hsa", universe=universe)
+    } else {
+      results[["kegg"]] <-
+        enrichKEGG(de, organism="hsa", universe=universe)
+    }
+  }
+  if (run_reactome) {
+    if (directional) {
+      results[["up_reactome"]] <-
+        enrichPathway(gene=up_de, universe=universe, readable=TRUE)
+      results[["down_reactome"]] <-
+        enrichPathway(gene=down_de, universe=universe, readable=TRUE)
+    } else {
+      results[["reactome"]] <-
+        enrichPathway(gene=de, universe=universe, readable=TRUE)
+    }
+  }
+  return(results)
+}
+```
+
+```{r}
+table(top$adj.P.Val < 0.1,
+      top$logFC < 0)
+```
+
+```{r}
+ora_results <- run_ora(
+  top %>% rename(entrez_gene_id="ENTREZID"),
+  run_kegg=TRUE, run_reactome=FALSE, p_threshold=0.1)
+```
+
+```{r}
+sapply(ora_results, function(x) {
+  a <- x@result %>% filter(p.adjust < 0.05) %>% nrow
+  b <- x@geneSets %>% length
+  sprintf("%d/%d", a, b)
+})
+```
+
+```{r}
+ora_results$up_go@result %>% filter(p.adjust < 0.05) %>% arrange(pvalue) %>% head(10)
+```
+
+```{r}
+ora_results$down_go@result %>% filter(p.adjust < 0.05) %>% arrange(pvalue) %>% head(10)
+```
+
+
+-----
+
+# Output top tables
+
+```{r}
+write_top_table <- function(df, path, n=1000) {
+  write.table(df %>% mutate_if(is.numeric, signif, 4) %>% head(n), 
+              file=path, quote=FALSE, row.names=FALSE, sep="\t")
+}
+```
+
+```{r}
+write_top_table(top_pro, path=here("outputs/top_proliferative.tsv"))
+write_top_table(top_sec, path=here("outputs/top_secretory.tsv"))
+write_top_table(top, path=here("outputs/top.tsv"))
+```
+
+```{r}
+write_ora_df <- function(df, path) {
+  write.table(df %>% filter(p.adjust < 0.05) %>% arrange(pvalue) %>% mutate_if(is.numeric, signif, 4),
+            file=path, quote=FALSE, row.names=FALSE, sep="\t")  
+}
+```
+
+```{r}
+write_ora_df(ora_results$up_go@result, path=here("outputs/ora_up_go.tsv"))
+write_ora_df(ora_results$down_go@result, path=here("outputs/ora_down_go.tsv"))
+```
+
+-----
+
+# Session Info
+
+```{r}
+if (nzchar(system.file(package="devtools"))) {
+  devtools::session_info()
+} else {
+  sessionInfo()
+}
+```
